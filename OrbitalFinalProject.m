@@ -44,7 +44,36 @@ fprintf('theta = %.6f deg\n\n', th0)
 
 fprintf('Semi-major axis a = %.6f km\n', a0)
 fprintf('Orbital period T  = %.6f s (%.6f min)\n\n', Torb, Torb/60)
+%% Plane Change Manuever
+inc_moon_deg = 28.6;
 
+% Circular parking-orbit speed
+vpark = sqrt(muE / rpark);
+
+% Simplified inclination-only plane-change angle
+delta_i_deg = abs(inc_moon_deg - inc_deg);
+
+% Plane-change Delta-V
+delV_plane = 2 * vpark * sind(delta_i_deg / 2);
+
+fprintf('--- Simplified LEO Plane Change ---\n')
+fprintf('Initial parking inclination = %.6f deg\n', inc_deg)
+fprintf('Target Earth-Moon inclination = %.6f deg\n', inc_moon_deg)
+fprintf('Inclination change = %.6f deg\n', delta_i_deg)
+fprintf('Parking orbit speed = %.6f km/s\n', vpark)
+fprintf('Plane-change Delta-V = %.9f km/s\n', delV_plane)
+fprintf('Plane-change Delta-V = %.6f m/s\n\n', 1000*delV_plane)
+
+% Now define the post-plane-change parking orbit directly
+inc_deg = inc_moon_deg;
+
+hmag = sqrt(muE * rpark);
+
+[r0_vec, v0_vec] = Perifocal2GE(hmag, inc_deg, RAAN_deg, epark, w_deg, theta, muE);
+
+fprintf('Post-plane-change parking-orbit state:\n')
+fprintf('r0 = [%.6f %.6f %.6f] km\n', r0_vec(1), r0_vec(2), r0_vec(3))
+fprintf('v0 = [%.6f %.6f %.6f] km/s\n\n', v0_vec(1), v0_vec(2), v0_vec(3))
 %% Time grid for one full orbit
 N = 500;
 tspan = linspace(0, Torb, N);
@@ -346,6 +375,275 @@ legend('Spacecraft arrival points','Moon positions at arrival', ...
 title('Arrival Geometry During Launch-Time Sweep')
 view(3)
 
+%% ---------------- PART 11: LUNAR CAPTURE BURN FROM PROPAGATED TLI STATE ----------------
+% This section starts from the actual propagated optimized TLI arrival state.
+% It performs a retrograde lunar capture burn, propagates the resulting
+% Moon-centered captured ellipse to perilune, and then circularizes.
+
+h_lunar_circ = 100;              % km, desired final circular lunar orbit altitude
+rp_target = RM + h_lunar_circ;   % km, target perilune radius
+
+% Moon-centered spacecraft state at end of propagated TLI
+r_rel_entry = r_arr_best - r_moon_arr_best;
+v_rel_entry = v_arr_best - v_moon_arr_best;
+
+r_entry = norm(r_rel_entry);
+v_entry = norm(v_rel_entry);
+
+fprintf('\n--- Moon-Relative State at TLI Arrival ---\n')
+fprintf('Moon-relative position radius     = %.6f km\n', r_entry)
+fprintf('Moon-relative altitude            = %.6f km\n', r_entry - RM)
+fprintf('Moon-relative speed               = %.6f km/s\n', v_entry)
+fprintf('Moon-relative radial velocity     = %.6f km/s\n', ...
+    dot(r_rel_entry, v_rel_entry)/r_entry)
+fprintf('Target circular orbit altitude    = %.6f km\n', h_lunar_circ)
+fprintf('Target perilune radius            = %.6f km\n', rp_target)
+
+if r_entry <= rp_target
+    error('TLI arrival radius is already below the target perilune radius. Increase target altitude or retarget TLI.');
+end
+
+% Apply first burn opposite the Moon-relative velocity direction.
+% The burn magnitude is selected so the resulting bound lunar ellipse has
+% the desired perilune radius.
+vhat_entry = v_rel_entry / norm(v_rel_entry);
+
+rp_error_fun = @(dV) lunarPeriapsisRadius( ...
+    r_rel_entry, ...
+    v_rel_entry - dV*vhat_entry, ...
+    muM) - rp_target;
+
+% Minimum burn needed to make the trajectory bound around the Moon
+v_escape_entry = sqrt(2*muM/r_entry);
+dV_min_bound = max(0, v_entry - 0.999999*v_escape_entry);
+
+% Maximum retrograde burn before reversing velocity
+dV_max = 0.999*v_entry;
+
+% Scan for a bracket because not every geometry can hit the selected
+% perilune radius with a pure retrograde burn at this pickup point.
+dV_scan = linspace(dV_min_bound, dV_max, 800);
+rp_err_scan = zeros(size(dV_scan));
+
+for k = 1:length(dV_scan)
+    rp_err_scan(k) = rp_error_fun(dV_scan(k));
+end
+
+idx_bracket = find(rp_err_scan(1:end-1).*rp_err_scan(2:end) <= 0, ...
+                   1, 'first');
+
+if isempty(idx_bracket)
+
+    fprintf('\nWARNING: Could not exactly target rp = %.6f km with a pure retrograde burn.\n', rp_target)
+    fprintf('Using the scanned capture burn that gives the closest perilune radius.\n')
+
+    [~, idx_best_rp] = min(abs(rp_err_scan));
+    delV_capture = dV_scan(idx_best_rp);
+
+else
+
+    dV_low = dV_scan(idx_bracket);
+    dV_high = dV_scan(idx_bracket+1);
+
+    delV_capture = fzero(rp_error_fun, [dV_low, dV_high]);
+
+end
+
+% Apply first lunar capture burn
+v_rel_capture = v_rel_entry - delV_capture*vhat_entry;
+
+% Post-capture lunar orbit properties
+[rp_capture, ra_capture, a_capture, e_capture, energy_capture] = ...
+    lunarOrbitShape(r_rel_entry, v_rel_capture, muM);
+
+fprintf('\n--- First Lunar Capture Burn ---\n')
+fprintf('Capture burn Delta-V              = %.6f km/s\n', delV_capture)
+fprintf('Capture burn Delta-V              = %.3f m/s\n', 1000*delV_capture)
+fprintf('Post-burn lunar specific energy   = %.6f km^2/s^2\n', energy_capture)
+fprintf('Post-burn semi-major axis         = %.6f km\n', a_capture)
+fprintf('Post-burn eccentricity            = %.8f\n', e_capture)
+fprintf('Post-burn perilune radius         = %.6f km\n', rp_capture)
+fprintf('Post-burn perilune altitude       = %.6f km\n', rp_capture - RM)
+fprintf('Post-burn apolune radius          = %.6f km\n', ra_capture)
+fprintf('Post-burn apolune altitude        = %.6f km\n', ra_capture - RM)
+
+if energy_capture >= 0
+    error('The post-capture trajectory is still unbound. Increase capture burn magnitude or retarget the arrival geometry.');
+end
+
+%% ---------------- PART 12: PROPAGATE CAPTURED ELLIPSE TO PERILUNE ----------------
+% Propagate the Moon-centered captured trajectory until radial velocity
+% crosses from negative to positive. This event indicates perilune passage.
+
+r0_lunar_capture = r_rel_entry;
+v0_lunar_capture = v_rel_capture;
+
+radial_rate0 = dot(r0_lunar_capture, v0_lunar_capture) / norm(r0_lunar_capture);
+
+if radial_rate0 > 0
+    warning(['The spacecraft is moving away from the Moon at the selected pickup point. ', ...
+             'This may mean your TLI endpoint is already after closest approach. ', ...
+             'Consider using the closest-approach state instead of r_arr_best/v_arr_best.'])
+end
+
+T_capture = 2*pi*sqrt(a_capture^3/muM);
+
+opts_perilune = odeset('RelTol',1e-11, ...
+                       'AbsTol',1e-11, ...
+                       'Events', @(t,y) lunarPeriluneEvent(t,y));
+
+[t_lunar_cap, y_lunar_cap, t_peri, y_peri] = ode45( ...
+    @(t,y) stateTwoBodyMoon(t,y,muM), ...
+    [0, T_capture], ...
+    [r0_lunar_capture; v0_lunar_capture], ...
+    opts_perilune);
+
+if isempty(t_peri)
+    error('Perilune event was not detected. Check the capture burn and the Moon-relative trajectory.');
+end
+
+r_peri_vec = y_peri(end,1:3).';
+v_peri_vec = y_peri(end,4:6).';
+
+r_peri = norm(r_peri_vec);
+v_peri = norm(v_peri_vec);
+
+fprintf('\n--- Propagated Perilune After Capture Burn ---\n')
+fprintf('Time from capture burn to perilune = %.6f s\n', t_peri(end))
+fprintf('Time from capture burn to perilune = %.6f hr\n', t_peri(end)/3600)
+fprintf('Propagated perilune radius         = %.6f km\n', r_peri)
+fprintf('Propagated perilune altitude       = %.6f km\n', r_peri - RM)
+fprintf('Speed at perilune before circ burn = %.6f km/s\n', v_peri)
+
+%% ---------------- PART 13: CIRCULARIZATION BURN AT LUNAR PERILUNE ----------------
+% At perilune, circularize into the final lunar parking orbit.
+
+v_circ_peri = sqrt(muM/r_peri);
+
+% At perilune the velocity should be tangential, so the circularization burn
+% is just the speed difference.
+delV_circ = abs(v_peri - v_circ_peri);
+
+% Apply circularization burn by setting speed equal to circular speed along
+% the current velocity direction.
+vhat_peri = v_peri_vec / norm(v_peri_vec);
+v_circ_vec = v_circ_peri * vhat_peri;
+
+fprintf('\n--- Circularization Burn at Lunar Perilune ---\n')
+fprintf('Circular speed at perilune          = %.6f km/s\n', v_circ_peri)
+fprintf('Circularization Delta-V             = %.6f km/s\n', delV_circ)
+fprintf('Circularization Delta-V             = %.3f m/s\n', 1000*delV_circ)
+
+fprintf('\n--- Lunar Capture Delta-V Budget ---\n')
+fprintf('First capture burn Delta-V          = %.6f km/s\n', delV_capture)
+fprintf('Circularization Delta-V             = %.6f km/s\n', delV_circ)
+fprintf('Total lunar orbit insertion Delta-V = %.6f km/s\n', delV_capture + delV_circ)
+
+fprintf('\n--- Total Mission Delta-V Estimate ---\n')
+fprintf('LEO plane-change Delta-V            = %.6f km/s\n', delV_plane)
+fprintf('TLI Delta-V                         = %.6f km/s\n', delV1)
+fprintf('Lunar capture burn Delta-V          = %.6f km/s\n', delV_capture)
+fprintf('Lunar circularization Delta-V       = %.6f km/s\n', delV_circ)
+fprintf('Total major impulsive Delta-V       = %.6f km/s\n', ...
+    delV_plane + delV1 + delV_capture + delV_circ)
+
+%% ---------------- PART 14: PROPAGATE FINAL CIRCULAR LUNAR ORBIT ----------------
+T_circ_lunar = 2*pi*sqrt(r_peri^3/muM);
+
+N_circ = 800;
+tspan_circ = linspace(0, T_circ_lunar, N_circ);
+
+opts_circ = odeset('RelTol',1e-12,'AbsTol',1e-12);
+
+[t_circ_out, y_circ] = ode45( ...
+    @(t,y) stateTwoBodyMoon(t,y,muM), ...
+    tspan_circ, ...
+    [r_peri_vec; v_circ_vec], ...
+    opts_circ);
+
+r_circ_hist = y_circ(:,1:3);
+v_circ_hist = y_circ(:,4:6);
+
+fprintf('\n--- Final Circular Lunar Orbit Check ---\n')
+fprintf('Final circular lunar orbit radius   = %.6f km\n', r_peri)
+fprintf('Final circular lunar orbit altitude = %.6f km\n', r_peri - RM)
+fprintf('Final circular orbit period         = %.6f s\n', T_circ_lunar)
+fprintf('Final circular orbit period         = %.6f hr\n', T_circ_lunar/3600)
+fprintf('Radius variation over one orbit     = %.12e km\n', ...
+    max(vecnorm(r_circ_hist,2,2)) - min(vecnorm(r_circ_hist,2,2)))
+
+%% ---------------- PART 15: LUNAR CAPTURE AND CIRCULARIZATION PLOTS ----------------
+
+figure
+plot3(y_lunar_cap(:,1), y_lunar_cap(:,2), y_lunar_cap(:,3), ...
+      'b-', 'LineWidth', 1.5)
+hold on
+plot3(r0_lunar_capture(1), r0_lunar_capture(2), r0_lunar_capture(3), ...
+      'go', 'MarkerFaceColor', 'g')
+plot3(r_peri_vec(1), r_peri_vec(2), r_peri_vec(3), ...
+      'ro', 'MarkerFaceColor', 'r')
+
+[xM,yM,zM] = sphere(100);
+surf(RM*xM, RM*yM, RM*zM, ...
+    'FaceColor', [0.7 0.7 0.7], ...
+    'EdgeColor', 'none', ...
+    'FaceAlpha', 0.35)
+
+grid on
+axis equal
+xlabel('x_M (km)')
+ylabel('y_M (km)')
+zlabel('z_M (km)')
+legend('Post-capture lunar ellipse', ...
+       'Capture burn point', ...
+       'Perilune / circularization point', ...
+       'Moon', ...
+       'Location', 'best')
+title('Propagated Lunar Capture Ellipse to Perilune')
+view(3)
+
+figure
+plot(t_lunar_cap/3600, vecnorm(y_lunar_cap(:,1:3),2,2) - RM, ...
+     'b-', 'LineWidth', 1.5)
+hold on
+plot(t_peri(end)/3600, r_peri - RM, ...
+     'ro', 'MarkerFaceColor', 'r')
+grid on
+xlabel('Time after lunar capture burn (hr)')
+ylabel('Altitude above lunar surface (km)')
+title('Altitude During Captured Lunar Ellipse')
+
+figure
+plot3(r_circ_hist(:,1), r_circ_hist(:,2), r_circ_hist(:,3), ...
+      'b-', 'LineWidth', 1.5)
+hold on
+plot3(r_peri_vec(1), r_peri_vec(2), r_peri_vec(3), ...
+      'ro', 'MarkerFaceColor', 'r')
+
+surf(RM*xM, RM*yM, RM*zM, ...
+    'FaceColor', [0.7 0.7 0.7], ...
+    'EdgeColor', 'none', ...
+    'FaceAlpha', 0.35)
+
+grid on
+axis equal
+xlabel('x_M (km)')
+ylabel('y_M (km)')
+zlabel('z_M (km)')
+legend('Final circular lunar orbit', ...
+       'Circularization point', ...
+       'Moon', ...
+       'Location', 'best')
+title('Final Circular Lunar Parking Orbit')
+view(3)
+
+figure
+plot(t_circ_out/3600, vecnorm(r_circ_hist,2,2) - RM, ...
+     'b-', 'LineWidth', 1.5)
+grid on
+xlabel('Time after circularization burn (hr)')
+ylabel('Altitude above lunar surface (km)')
+title('Final Circular Lunar Orbit Altitude')
 %% ---------------- LOCAL FUNCTIONS ----------------
 function [r_depart, v_depart, r_hist, v_hist, r_arr, v_arr, ...
           r_moon_arr, v_moon_arr, miss_distance, v_inf_arr, t_hist] = ...
@@ -408,4 +706,76 @@ function dydt = stateMoonGravity(t,y,muE,muM,jd0)
         -muM * Rm / norm(Rm)^3;
 
     dydt = [v; a];
+end
+
+function dydt = stateTwoBodyMoon(~, y, muM)
+
+    r = y(1:3);
+    v = y(4:6);
+
+    a = -muM * r / norm(r)^3;
+
+    dydt = [v; a];
+
+end
+function [value, isterminal, direction] = lunarPeriluneEvent(~, y)
+
+    r = y(1:3);
+    v = y(4:6);
+
+    % Perilune occurs when radial velocity crosses from negative to positive.
+    value = dot(r,v)/norm(r);
+
+    isterminal = 1;
+    direction = +1;
+
+end
+
+function rp = lunarPeriapsisRadius(r_vec, v_vec, muM)
+
+    r = norm(r_vec);
+    v = norm(v_vec);
+
+    energy = v^2/2 - muM/r;
+
+    if energy >= 0
+        rp = Inf;
+        return
+    end
+
+    h_vec = cross(r_vec, v_vec);
+
+    e_vec = cross(v_vec, h_vec)/muM - r_vec/r;
+    e = norm(e_vec);
+
+    a = -muM/(2*energy);
+
+    rp = a*(1 - e);
+
+end
+
+function [rp, ra, a, e, energy] = lunarOrbitShape(r_vec, v_vec, muM)
+
+    r = norm(r_vec);
+    v = norm(v_vec);
+
+    energy = v^2/2 - muM/r;
+
+    h_vec = cross(r_vec, v_vec);
+
+    e_vec = cross(v_vec, h_vec)/muM - r_vec/r;
+    e = norm(e_vec);
+
+    if energy >= 0
+        a = Inf;
+        rp = Inf;
+        ra = Inf;
+        return
+    end
+
+    a = -muM/(2*energy);
+
+    rp = a*(1 - e);
+    ra = a*(1 + e);
+
 end
